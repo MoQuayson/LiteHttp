@@ -15,10 +15,8 @@ A production-grade, allocation-minimal HTTP client wrapper for .NET 8+, built on
 
 ## Installation
 
-No NuGet package is published yet. Reference the project directly:
-
-```xml
-<ProjectReference Include="path/to/src/LiteHttp/LiteHttp.csproj" />
+```csharp
+dotnet add package LiteHttp --version 1.0.0-preview.6
 ```
 
 Build requires .NET 8 SDK or later.
