@@ -41,7 +41,7 @@ var post = await client.GetJsonAsync<Post>("/posts/1");
 using var response = await client.PostJsonAsync("/posts", new NewPost(1, "Hello", "Body"));
 response.EnsureSuccessStatusCode();
 
-// POST JSON (typed response)
+// POST JSON (typed response) — throws LiteHttpRequestException (with the response body) on failure
 var created = await client.PostJsonAsync<NewPost, Post>("/posts", new NewPost(1, "Title", "Body"));
 ```
 
@@ -57,7 +57,8 @@ Pass `LiteHttpClientOptions` at construction time. All properties are `init`-onl
 | `PooledConnectionLifetime` | `TimeSpan` | 5 min | DNS refresh interval for pooled connections |
 | `PooledConnectionIdleTimeout` | `TimeSpan` | 2 min | Idle connection eviction threshold |
 | `MaxConnectionsPerServer` | `int` | 20 | Max concurrent connections per endpoint |
-| `DefaultMaxRetries` | `int` | 3 | Retry attempts per request (0 = no retry) |
+| `DefaultMaxRetries` | `int` | 3 | Retry attempts per request (0 = no retry). Each attempt gets its own `DefaultTimeout` window — see [Retry behavior](#retry-behavior) |
+| `MaxRetryAfterDelay` | `TimeSpan` | 60 s | Upper bound on how long a retry wait may be when honoring a server's `Retry-After` header |
 | `UseCookies` | `bool` | `false` | Enable cookie container |
 | `DefaultHeaders` | `IReadOnlyDictionary<string, string>?` | `null` | Headers sent on every request |
 | `JsonSerializerOptions` | `JsonSerializerOptions?` | `null` | Custom JSON serializer options |
@@ -223,6 +224,8 @@ public class OrderService(ILiteHttpClientFactory factory)
 
 > `ILiteHttpClientFactory` is only registered when at least one named client is added. Calling only `AddLiteHttpClient` and then injecting `ILiteHttpClientFactory` will throw at runtime.
 
+> `DefaultLiteHttpClientFactory` implements `IDisposable` and disposes every named client it holds when the DI container is disposed — you don't need to dispose named clients yourself.
+
 ## Resilience (Polly)
 
 Both methods wrap the client in a `ResiliencePipeline<HttpResponseMessage>` built with `Microsoft.Extensions.Resilience`. When active, the client's own `DefaultMaxRetries` is automatically set to `0` to prevent double-retrying.
@@ -283,17 +286,47 @@ The built-in retry loop (used when `DefaultMaxRetries > 0` and no Polly pipeline
 
 **Exceptions:** `HttpRequestException`, `TimeoutException`, `IOException`
 
-Back-off uses exponential delay with full jitter:
+All of these represent failures where the request either never reached the origin's application logic or explicitly asked to be retried, so retrying is safe by default even for non-idempotent methods (POST/PATCH). A custom resilience pipeline with broader retry conditions must preserve that property itself.
+
+Back-off uses exponential delay with full jitter, unless the response carries a `Retry-After` header — in which case that delay is honored instead (capped at `MaxRetryAfterDelay`, default 60 s):
 
 ```
-delay = random(0, min(10 s, 200 ms × 2^attempt))
+delay = random(0, min(10 s, 200 ms × 2^attempt))   // no Retry-After header
+delay = min(Retry-After, MaxRetryAfterDelay)        // Retry-After header present
 ```
+
+**Timeouts are per-attempt, not per-request.** Each retry attempt gets its own fresh `DefaultTimeout` (or per-request `Timeout`) window — a slow attempt that times out consumes one retry rather than exhausting the whole request's time budget. `TimeoutException` is only thrown once retries are exhausted. Cancelling via your own `CancellationToken` is unaffected — it always propagates as `OperationCanceledException`, never converted to `TimeoutException`.
 
 `HttpRequestMessage` is rebuilt on each retry attempt.
+
+## Error handling
+
+The typed JSON overloads (`GetJsonAsync<T>`, `PostJsonAsync<TReq,TResp>`, `PutJsonAsync<TReq,TResp>`, `PatchJsonAsync<TReq,TResp>`) and `StreamLinesAsync` throw `LiteHttpRequestException` — not the body-less exception from `EnsureSuccessStatusCode` — on a non-success status code:
+
+```csharp
+try
+{
+    var post = await client.GetJsonAsync<Post>("/posts/999");
+}
+catch (LiteHttpRequestException ex)
+{
+    Console.WriteLine($"{ex.StatusCode}: {ex.ResponseBody}");
+}
+```
+
+| Member | Description |
+|---|---|
+| `StatusCode` | The response's `HttpStatusCode` (inherited from `HttpRequestException`) |
+| `ResponseBody` | The full response body, if it could be read |
+| `Message` | Status code + a preview of the body, truncated to 2000 characters |
+
+Raw-response overloads (`PostJsonAsync`, `PutJsonAsync`, `PatchJsonAsync`, `GetAsync`, etc.) are unaffected — they still return the `HttpResponseMessage` as-is for you to inspect or call `EnsureSuccessStatusCode()` yourself.
 
 ## Logging
 
 LiteHttp logs via the standard `ILogger<LiteHttpClient>` abstraction. Log output is controlled by your host's logging configuration — no additional setup required.
+
+When registered via DI (`AddLiteHttpClient` / `AddNamedLiteHttpClient`), the logger is resolved with `GetRequiredService<ILogger<LiteHttpClient>>()` and will throw at startup if logging is not configured. `WebApplication.CreateBuilder` adds logging automatically, so this only fails with a custom host that omits `AddLogging()`.
 
 | Level | Event |
 |-------------|-------|
@@ -342,6 +375,7 @@ src/
   LiteHttp/                          # Core library (net8.0)
     LiteHttpClient.cs                # Main client implementation
     LiteHttpClientOptions.cs         # LiteHttpClientOptions + RequestOptions
+    LiteHttpRequestException.cs      # Thrown by typed overloads on non-success status
     ILiteHttpClient.cs               # Public interface
     Extensions/
       ServiceCollectionExtensions.cs # DI registration helpers

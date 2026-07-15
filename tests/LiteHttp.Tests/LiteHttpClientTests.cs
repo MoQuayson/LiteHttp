@@ -1,8 +1,10 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Net;
 using System.Net.Http;
+using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
 using System.Threading;
@@ -375,5 +377,200 @@ public sealed class LiteHttpClientTests
         var fields = new[] { new KeyValuePair<string, string>("key", "value") };
         using var response = await client.PostFormAsync("/form", fields);
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+    }
+
+    // ── StreamLinesAsync ordering ────────────────────────────────────────────
+
+    [Fact]
+    public async Task StreamLinesAsync_Forces_ResponseHeadersRead_After_Caller_Configure()
+    {
+        using var client = new LiteHttpClient(new StubHandler((_, _) =>
+        {
+            var response = new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StreamContent(new MemoryStream(Encoding.UTF8.GetBytes("line one\n"))),
+            };
+            return Task.FromResult(response);
+        }), new LiteHttpClientOptions { BaseAddress = new Uri("https://test.example.com"), DefaultMaxRetries = 0 });
+
+        RequestOptions? captured = null;
+
+        await foreach (var _ in client.StreamLinesAsync("/sse", o =>
+        {
+            // A caller's configure delegate that happens to (accidentally or otherwise) set this
+            // flag must not be able to disable streaming — StreamLinesAsync forces it back on.
+            o.ResponseHeadersRead = false;
+            captured = o;
+        }))
+        {
+        }
+
+        Assert.NotNull(captured);
+        Assert.True(captured!.ResponseHeadersRead);
+    }
+
+    // ── Retry-After header ───────────────────────────────────────────────────
+
+    [Fact]
+    public async Task Retries_Honor_RetryAfter_Header_Delay()
+    {
+        int callCount = 0;
+        using var client = new LiteHttpClient(new StubHandler((_, _) =>
+        {
+            callCount++;
+            if (callCount == 1)
+            {
+                var response = new HttpResponseMessage(HttpStatusCode.ServiceUnavailable);
+                response.Headers.RetryAfter = new RetryConditionHeaderValue(TimeSpan.FromMilliseconds(400));
+                return Task.FromResult(response);
+            }
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK));
+        }), new LiteHttpClientOptions { BaseAddress = new Uri("https://test.example.com"), DefaultMaxRetries = 1 });
+
+        var sw = Stopwatch.StartNew();
+        using var response = await client.GetAsync("/rate-limited");
+        sw.Stop();
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Equal(2, callCount);
+        // Default jittered back-off for attempt 0 is capped at 200ms; a >=350ms wait proves the
+        // 400ms Retry-After was honored instead of the jittered default.
+        Assert.True(sw.ElapsedMilliseconds >= 350,
+            $"Expected the Retry-After delay (~400ms) to be honored, elapsed={sw.ElapsedMilliseconds}ms");
+    }
+
+    [Fact]
+    public async Task Retries_Cap_RetryAfter_Delay_At_MaxRetryAfterDelay()
+    {
+        int callCount = 0;
+        using var client = new LiteHttpClient(new StubHandler((_, _) =>
+        {
+            callCount++;
+            if (callCount == 1)
+            {
+                var response = new HttpResponseMessage(HttpStatusCode.ServiceUnavailable);
+                response.Headers.RetryAfter = new RetryConditionHeaderValue(TimeSpan.FromSeconds(30));
+                return Task.FromResult(response);
+            }
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK));
+        }), new LiteHttpClientOptions
+        {
+            BaseAddress       = new Uri("https://test.example.com"),
+            DefaultMaxRetries = 1,
+            MaxRetryAfterDelay = TimeSpan.FromMilliseconds(300),
+        });
+
+        var sw = Stopwatch.StartNew();
+        using var response = await client.GetAsync("/rate-limited");
+        sw.Stop();
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.True(sw.ElapsedMilliseconds < 5000,
+            $"Expected the 30s Retry-After to be capped at MaxRetryAfterDelay, elapsed={sw.ElapsedMilliseconds}ms");
+    }
+
+    // ── LiteHttpRequestException carries the response body ──────────────────
+
+    [Fact]
+    public async Task GetJsonAsync_Throws_LiteHttpRequestException_With_Body_On_Error()
+    {
+        const string errorBody = "{\"error\":\"not found\"}";
+        using var client = new LiteHttpClient(new StubHandler((_, _) =>
+            Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotFound)
+            {
+                Content = new StringContent(errorBody, Encoding.UTF8, "application/json"),
+            })), new LiteHttpClientOptions { BaseAddress = new Uri("https://test.example.com"), DefaultMaxRetries = 0 });
+
+        var ex = await Assert.ThrowsAsync<LiteHttpRequestException>(() => client.GetJsonAsync<object>("/missing"));
+
+        Assert.Equal(HttpStatusCode.NotFound, ex.StatusCode);
+        Assert.Equal(errorBody, ex.ResponseBody);
+        Assert.Contains(errorBody, ex.Message);
+    }
+
+    [Fact]
+    public async Task LiteHttpRequestException_Truncates_Long_Response_Bodies_In_Message_Only()
+    {
+        var longBody = new string('x', 5000);
+        using var client = new LiteHttpClient(new StubHandler((_, _) =>
+            Task.FromResult(new HttpResponseMessage(HttpStatusCode.InternalServerError)
+            {
+                Content = new StringContent(longBody, Encoding.UTF8, "text/plain"),
+            })), new LiteHttpClientOptions { BaseAddress = new Uri("https://test.example.com"), DefaultMaxRetries = 0 });
+
+        var ex = await Assert.ThrowsAsync<LiteHttpRequestException>(() => client.GetJsonAsync<object>("/big-error"));
+
+        Assert.Equal(longBody, ex.ResponseBody);
+        Assert.Contains("...(truncated)", ex.Message);
+        Assert.True(ex.Message.Length < longBody.Length);
+    }
+
+    // ── Per-attempt timeout ───────────────────────────────────────────────────
+
+    [Fact]
+    public async Task Retries_After_Per_Attempt_Timeout_Then_Succeeds()
+    {
+        int callCount = 0;
+        using var client = new LiteHttpClient(new StubHandler(async (_, ct) =>
+        {
+            callCount++;
+            if (callCount == 1)
+            {
+                await Task.Delay(TimeSpan.FromSeconds(5), ct); // exceeds the 50ms per-attempt timeout
+                return new HttpResponseMessage(HttpStatusCode.OK);
+            }
+            return new HttpResponseMessage(HttpStatusCode.OK);
+        }), new LiteHttpClientOptions
+        {
+            BaseAddress       = new Uri("https://test.example.com"),
+            DefaultTimeout    = TimeSpan.FromMilliseconds(50),
+            DefaultMaxRetries = 1,
+        });
+
+        var sw = Stopwatch.StartNew();
+        using var response = await client.GetAsync("/slow-then-fast");
+        sw.Stop();
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Equal(2, callCount);
+        // Each attempt gets its own 50ms window — total should be nowhere near the 5s handler delay.
+        Assert.True(sw.ElapsedMilliseconds < 4000,
+            $"Expected the timed-out first attempt to be retried quickly, elapsed={sw.ElapsedMilliseconds}ms");
+    }
+
+    [Fact]
+    public async Task Timeout_Throws_After_Retries_Exhausted()
+    {
+        using var client = new LiteHttpClient(new StubHandler(async (_, ct) =>
+        {
+            await Task.Delay(TimeSpan.FromSeconds(5), ct);
+            return new HttpResponseMessage(HttpStatusCode.OK);
+        }), new LiteHttpClientOptions
+        {
+            BaseAddress       = new Uri("https://test.example.com"),
+            DefaultTimeout    = TimeSpan.FromMilliseconds(30),
+            DefaultMaxRetries = 2,
+        });
+
+        await Assert.ThrowsAsync<TimeoutException>(() => client.GetAsync("/always-slow"));
+    }
+
+    [Fact]
+    public async Task External_Cancellation_Is_Not_Converted_To_TimeoutException()
+    {
+        using var cts = new CancellationTokenSource();
+        using var client = new LiteHttpClient(new StubHandler(async (_, ct) =>
+        {
+            cts.Cancel();
+            await Task.Delay(Timeout.Infinite, ct);
+            return new HttpResponseMessage(HttpStatusCode.OK);
+        }), new LiteHttpClientOptions
+        {
+            BaseAddress       = new Uri("https://test.example.com"),
+            DefaultTimeout    = TimeSpan.FromSeconds(30),
+            DefaultMaxRetries = 2,
+        });
+
+        await Assert.ThrowsAsync<TaskCanceledException>(() => client.GetAsync("/cancel-me", ct: cts.Token));
     }
 }

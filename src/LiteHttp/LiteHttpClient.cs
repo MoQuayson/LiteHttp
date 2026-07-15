@@ -92,7 +92,7 @@ public sealed class LiteHttpClient : ILiteHttpClient, IDisposable
         CancellationToken ct = default)
     {
         using var response = await GetAsync(url, configure, ct).ConfigureAwait(false);
-        response.EnsureSuccessStatusCode();
+        await EnsureSuccessAsync(response, ct).ConfigureAwait(false);
         return await ReadJsonAsync<T>(response, ct).ConfigureAwait(false);
     }
 
@@ -120,7 +120,7 @@ public sealed class LiteHttpClient : ILiteHttpClient, IDisposable
         CancellationToken ct = default)
     {
         using var response = await PostJsonAsync(url, payload, configure, ct).ConfigureAwait(false);
-        response.EnsureSuccessStatusCode();
+        await EnsureSuccessAsync(response, ct).ConfigureAwait(false);
         return await ReadJsonAsync<TResponse>(response, ct).ConfigureAwait(false);
     }
 
@@ -138,7 +138,7 @@ public sealed class LiteHttpClient : ILiteHttpClient, IDisposable
         CancellationToken ct = default)
     {
         using var response = await PutJsonAsync(url, payload, configure, ct).ConfigureAwait(false);
-        response.EnsureSuccessStatusCode();
+        await EnsureSuccessAsync(response, ct).ConfigureAwait(false);
         return await ReadJsonAsync<TResponse>(response, ct).ConfigureAwait(false);
     }
 
@@ -156,7 +156,7 @@ public sealed class LiteHttpClient : ILiteHttpClient, IDisposable
         CancellationToken ct = default)
     {
         using var response = await PatchJsonAsync(url, payload, configure, ct).ConfigureAwait(false);
-        response.EnsureSuccessStatusCode();
+        await EnsureSuccessAsync(response, ct).ConfigureAwait(false);
         return await ReadJsonAsync<TResponse>(response, ct).ConfigureAwait(false);
     }
 
@@ -213,11 +213,14 @@ public sealed class LiteHttpClient : ILiteHttpClient, IDisposable
     {
         using var response = await GetAsync(url, o =>
         {
-            o.ResponseHeadersRead = true;
+            // Run the caller's configure first, then force streaming on — otherwise a caller whose
+            // configure delegate happens to touch ResponseHeadersRead (directly, or via a shared
+            // helper) would silently disable streaming and force full-body buffering.
             configure?.Invoke(o);
+            o.ResponseHeadersRead = true;
         }, ct).ConfigureAwait(false);
 
-        response.EnsureSuccessStatusCode();
+        await EnsureSuccessAsync(response, ct).ConfigureAwait(false);
 
         await using var stream = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
         using var reader = new StreamReader(stream, Encoding.UTF8,
@@ -313,7 +316,7 @@ public sealed class LiteHttpClient : ILiteHttpClient, IDisposable
         return await SendCoreAsync(method, url, bodyFactory, opts, maxRetries, ct).ConfigureAwait(false);
     }
 
-    private async Task<HttpResponseMessage> SendCoreAsync(
+    private Task<HttpResponseMessage> SendCoreAsync(
         HttpMethod method,
         string url,
         Func<HttpContent?>? bodyFactory,
@@ -322,37 +325,30 @@ public sealed class LiteHttpClient : ILiteHttpClient, IDisposable
         CancellationToken ct)
     {
         var timeout = opts.Timeout ?? _options.DefaultTimeout;
-        using var timeoutCts = new CancellationTokenSource(timeout);
-        using var linkedCts  = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
-
-        try
-        {
-            return await ExecuteWithRetryAsync(method, url, bodyFactory, opts, maxRetries, linkedCts.Token)
-                .ConfigureAwait(false);
-        }
-        catch (OperationCanceledException oce)
-            when (timeoutCts.IsCancellationRequested && !ct.IsCancellationRequested)
-        {
-            _logger.LogWarning("Request {Method} {Url} timed out after {Timeout}s",
-                method, url, timeout.TotalSeconds);
-            throw new TimeoutException(
-                $"Request '{method} {url}' timed out after {timeout.TotalSeconds}s.", oce);
-        }
+        return ExecuteWithRetryAsync(method, url, bodyFactory, opts, maxRetries, timeout, ct);
     }
 
+    /// <summary>
+    /// Each attempt gets its own <paramref name="timeout"/> window (linked to the caller's <paramref name="ct"/>).
+    /// A per-attempt timeout is treated like any other transient failure and consumes one retry rather than
+    /// aborting the whole operation, so a fixed timeout doesn't get eaten by an earlier slow attempt.
+    /// </summary>
     private async Task<HttpResponseMessage> ExecuteWithRetryAsync(
         HttpMethod method,
         string url,
         Func<HttpContent?>? bodyFactory,
         RequestOptions opts,
         int maxRetries,
+        TimeSpan timeout,
         CancellationToken ct)
     {
         int attempts = 0;
 
         while (true)
         {
-            using var request = BuildRequest(method, url, bodyFactory?.Invoke(), opts);
+            using var request    = BuildRequest(method, url, bodyFactory?.Invoke(), opts);
+            using var timeoutCts = new CancellationTokenSource(timeout);
+            using var linkedCts  = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
 
             _logger.LogInformation("Sending HTTP request {Method} {Url}", method, url);
             if (_logger.IsEnabled(LogLevel.Trace))
@@ -370,17 +366,18 @@ public sealed class LiteHttpClient : ILiteHttpClient, IDisposable
                 response = _resiliencePipeline is not null
                     ? await _resiliencePipeline.ExecuteAsync(
                         async token => await _inner.SendAsync(request, completion, token).ConfigureAwait(false),
-                        ct).ConfigureAwait(false)
-                    : await _inner.SendAsync(request, completion, ct).ConfigureAwait(false);
+                        linkedCts.Token).ConfigureAwait(false)
+                    : await _inner.SendAsync(request, completion, linkedCts.Token).ConfigureAwait(false);
 
                 if (ShouldRetry(response.StatusCode) && attempts < maxRetries)
                 {
+                    var retryAfter = GetRetryAfterDelay(response);
                     _logger.LogWarning(
                         "Retry {Attempt}/{Max} for {Method} {Url} — received {StatusCode}",
                         attempts + 1, maxRetries, method, url, (int)response.StatusCode);
                     response.Dispose();
                     response = null;
-                    await DelayAsync(attempts, ct).ConfigureAwait(false);
+                    await DelayAsync(attempts, retryAfter, ct).ConfigureAwait(false);
                     attempts++;
                     continue;
                 }
@@ -393,16 +390,54 @@ public sealed class LiteHttpClient : ILiteHttpClient, IDisposable
 
                 return response;
             }
+            catch (OperationCanceledException oce)
+                when (timeoutCts.IsCancellationRequested && !ct.IsCancellationRequested)
+            {
+                response?.Dispose();
+
+                if (attempts < maxRetries)
+                {
+                    _logger.LogWarning(
+                        "Retry {Attempt}/{Max} for {Method} {Url} — attempt timed out after {Timeout}s",
+                        attempts + 1, maxRetries, method, url, timeout.TotalSeconds);
+                    await DelayAsync(attempts, retryAfter: null, ct).ConfigureAwait(false);
+                    attempts++;
+                    continue;
+                }
+
+                _logger.LogWarning("Request {Method} {Url} timed out after {Timeout}s",
+                    method, url, timeout.TotalSeconds);
+                throw new TimeoutException(
+                    $"Request '{method} {url}' timed out after {timeout.TotalSeconds}s ({attempts + 1} attempt(s)).", oce);
+            }
             catch (Exception ex) when (IsTransient(ex) && attempts < maxRetries)
             {
                 response?.Dispose();
                 _logger.LogWarning(ex,
                     "Retry {Attempt}/{Max} for {Method} {Url} — {ExceptionType}",
                     attempts + 1, maxRetries, method, url, ex.GetType().Name);
-                await DelayAsync(attempts, ct).ConfigureAwait(false);
+                await DelayAsync(attempts, retryAfter: null, ct).ConfigureAwait(false);
                 attempts++;
             }
         }
+    }
+
+    /// <summary>Reads a server-provided Retry-After delay, capped at <see cref="LiteHttpClientOptions.MaxRetryAfterDelay"/>.</summary>
+    private TimeSpan? GetRetryAfterDelay(HttpResponseMessage response)
+    {
+        var retryAfter = response.Headers.RetryAfter;
+        if (retryAfter is null) return null;
+
+        TimeSpan? delay = retryAfter.Delta is { } delta
+            ? delta
+            : retryAfter.Date is { } date
+                ? date - DateTimeOffset.UtcNow
+                : null;
+
+        if (delay is null || delay <= TimeSpan.Zero) return null;
+
+        var cap = _options.MaxRetryAfterDelay;
+        return delay > cap ? cap : delay;
     }
 
     private void LogHeaders(
@@ -463,15 +498,51 @@ public sealed class LiteHttpClient : ILiteHttpClient, IDisposable
     private static bool IsTransient(Exception ex) =>
         ex is HttpRequestException or TimeoutException or IOException;
 
-    /// <summary>Exponential back-off with full jitter: delay = rand(0, min(cap, base * 2^attempt)).</summary>
-    private static Task DelayAsync(int attempt, CancellationToken ct)
+    /// <summary>
+    /// Delay before the next retry attempt. When the server supplied a Retry-After delay, that value
+    /// is honored as-is (already capped by <see cref="GetRetryAfterDelay"/>); otherwise falls back to
+    /// exponential back-off with full jitter: delay = rand(0, min(cap, base * 2^attempt)).
+    /// </summary>
+    private static Task DelayAsync(int attempt, TimeSpan? retryAfter, CancellationToken ct)
     {
+        if (retryAfter is { } ra)
+            return Task.Delay(ra, ct);
+
         const int baseMs = 200;
         const int capMs  = 10_000;
         var ceiling = Math.Min(capMs, baseMs * (1 << attempt));
         var delay   = Random.Shared.Next(0, ceiling);
         return Task.Delay(delay, ct);
     }
+
+    /// <summary>
+    /// Throws <see cref="LiteHttpRequestException"/> (carrying the response body) when the status
+    /// code is not a success. Reading the body is best-effort — a failure to read it must not mask
+    /// the original status error.
+    /// </summary>
+    private static async Task EnsureSuccessAsync(HttpResponseMessage response, CancellationToken ct)
+    {
+        if (response.IsSuccessStatusCode) return;
+
+        string? body = null;
+        try
+        {
+            body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+        }
+        catch
+        {
+            // best-effort only
+        }
+
+        var message = $"Request failed with status code {(int)response.StatusCode} ({response.StatusCode}).";
+        if (!string.IsNullOrEmpty(body))
+            message += $" Response body: {Truncate(body, 2000)}";
+
+        throw new LiteHttpRequestException(response.StatusCode, body, message);
+    }
+
+    private static string Truncate(string value, int maxLength) =>
+        value.Length <= maxLength ? value : string.Concat(value.AsSpan(0, maxLength), "...(truncated)");
 
     // ─────────────────────────────────────────────────────────────────────────
     // IDisposable

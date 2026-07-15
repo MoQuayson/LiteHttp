@@ -28,8 +28,28 @@ public sealed record LiteHttpClientOptions
     /// <summary>TCP connect timeout — distinct from the overall request timeout.</summary>
     public TimeSpan ConnectTimeout { get; init; } = TimeSpan.FromSeconds(10);
 
-    /// <summary>Number of automatic retries on transient failures (0 = no retry).</summary>
+    /// <summary>
+    /// Number of automatic retries on transient failures (0 = no retry). Each attempt gets its own
+    /// <see cref="DefaultTimeout"/> window — a slow attempt that times out consumes one retry rather
+    /// than exhausting the whole request's time budget.
+    /// </summary>
+    /// <remarks>
+    /// The default retried conditions (status codes 408, 429, 500, 502, 503, 504 and
+    /// <see cref="System.Net.Http.HttpRequestException"/>/<see cref="TimeoutException"/>/<see cref="System.IO.IOException"/>)
+    /// all represent failures where the request either never reached the origin's application logic
+    /// or explicitly asked to be retried, so retrying is safe by default even for non-idempotent
+    /// methods (POST/PATCH). If you plug in a custom resilience pipeline with broader retry
+    /// conditions, verify they preserve that property before retrying non-idempotent requests.
+    /// </remarks>
     public int DefaultMaxRetries { get; init; } = 3;
+
+    /// <summary>
+    /// Upper bound on how long a single retry wait may be when honoring a server's
+    /// <c>Retry-After</c> response header (RFC 9110 §10.2.3). Prevents a misbehaving or malicious
+    /// server from stalling the client indefinitely. Ignored when the header is absent, in which
+    /// case the jittered exponential back-off is used instead.
+    /// </summary>
+    public TimeSpan MaxRetryAfterDelay { get; init; } = TimeSpan.FromSeconds(60);
 
     /// <summary>Whether the handler should manage a cookie container.</summary>
     public bool UseCookies { get; init; } = false;

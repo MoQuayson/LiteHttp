@@ -163,9 +163,10 @@ public interface ILiteHttpClientFactory
 
 internal sealed record NamedClient(string Name, LiteHttpClient Client);
 
-internal sealed class DefaultLiteHttpClientFactory : ILiteHttpClientFactory
+internal sealed class DefaultLiteHttpClientFactory : ILiteHttpClientFactory, IDisposable
 {
     private readonly ConcurrentDictionary<string, LiteHttpClient> _map = new();
+    private bool _disposed;
 
     public DefaultLiteHttpClientFactory(IEnumerable<NamedClient> clients)
     {
@@ -177,4 +178,17 @@ internal sealed class DefaultLiteHttpClientFactory : ILiteHttpClientFactory
         => _map.TryGetValue(name, out var c)
                ? c
                : throw new InvalidOperationException($"No LiteHttpClient registered with name '{name}'.");
+
+    /// <summary>
+    /// Disposes every named client. The DI container only tracks and disposes the types it directly
+    /// resolves — the <see cref="NamedClient"/> record wrapping each client is not itself disposable,
+    /// so this factory is the only thing that owns their lifetime and must dispose them explicitly.
+    /// </summary>
+    public void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true;
+        foreach (var client in _map.Values)
+            client.Dispose();
+    }
 }
