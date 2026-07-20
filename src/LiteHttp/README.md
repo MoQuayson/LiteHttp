@@ -16,10 +16,10 @@ A production-grade, allocation-minimal HTTP client wrapper for .NET 8+, built on
 ## Installation
 
 ```csharp
-dotnet add package LiteHttp --version 1.0.0-preview.6
+dotnet add package LiteHttp
 ```
 
-Build requires .NET 8 SDK or later.
+Build requires .NET 8 SDK or later. See [CHANGELOG.md](https://github.com/MoQuayson/LiteHttp/blob/main/CHANGELOG.md) for release history.
 
 ## Quick start
 
@@ -118,6 +118,11 @@ var created = await client.PostJsonAsync<NewPost, Post>("/posts", payload, ct: c
 ### PUT / PATCH
 
 ```csharp
+// Body-less
+using var published = await client.PutAsync("/posts/1/publish", ct: ct);
+using var archived   = await client.PatchAsync("/posts/1/archive", ct: ct);
+
+// JSON body
 using var put   = await client.PutJsonAsync("/posts/1", updated, ct: ct);
 using var patch = await client.PatchJsonAsync("/posts/1", delta, ct: ct);
 
@@ -170,7 +175,7 @@ using var response = await client.PostMultipartAsync("/batch", () =>
 
 ### Streaming (SSE / NDJSON)
 
-`StreamLinesAsync` reads with `HttpCompletionOption.ResponseHeadersRead` and yields non-empty lines without buffering the full body.
+`StreamLinesAsync` reads with `HttpCompletionOption.ResponseHeadersRead` and yields non-empty lines without buffering the full body. Each line read resets an idle timeout (the request's `Timeout`, or `DefaultTimeout`) — a stream that produces no data for a full timeout window throws `TimeoutException` instead of hanging indefinitely.
 
 ```csharp
 await foreach (var line in client.StreamLinesAsync("/events", ct: ct))
@@ -225,6 +230,8 @@ public class OrderService(ILiteHttpClientFactory factory)
 > `ILiteHttpClientFactory` is only registered when at least one named client is added. Calling only `AddLiteHttpClient` and then injecting `ILiteHttpClientFactory` will throw at runtime.
 
 > `DefaultLiteHttpClientFactory` implements `IDisposable` and disposes every named client it holds when the DI container is disposed — you don't need to dispose named clients yourself.
+
+> Registering two named clients under the same name throws `InvalidOperationException` at startup rather than silently discarding the first registration.
 
 ## Resilience (Polly)
 
@@ -322,11 +329,13 @@ catch (LiteHttpRequestException ex)
 
 Raw-response overloads (`PostJsonAsync`, `PutJsonAsync`, `PatchJsonAsync`, `GetAsync`, etc.) are unaffected — they still return the `HttpResponseMessage` as-is for you to inspect or call `EnsureSuccessStatusCode()` yourself.
 
+Invalid input — a null or empty `url`, a null `HttpMethod`, or a null form/multipart delegate — throws `ArgumentException`/`ArgumentNullException` immediately, before any request is sent.
+
 ## Logging
 
 LiteHttp logs via the standard `ILogger<LiteHttpClient>` abstraction. Log output is controlled by your host's logging configuration — no additional setup required.
 
-When registered via DI (`AddLiteHttpClient` / `AddNamedLiteHttpClient`), the logger is resolved with `GetRequiredService<ILogger<LiteHttpClient>>()` and will throw at startup if logging is not configured. `WebApplication.CreateBuilder` adds logging automatically, so this only fails with a custom host that omits `AddLogging()`.
+When registered via DI (`AddLiteHttpClient` / `AddNamedLiteHttpClient`), the logger is resolved optionally — if no `ILogger<LiteHttpClient>` is registered, the client falls back to a no-op logger instead of throwing at startup. Call `AddLogging()` on your host to see log output.
 
 | Level | Event |
 |-------------|-------|
@@ -334,7 +343,7 @@ When registered via DI (`AddLiteHttpClient` / `AddNamedLiteHttpClient`), the log
 | `Information` | Response received (`Received HTTP response {StatusCode} for {Method} {Url} after {ElapsedMs}ms`) |
 | `Warning` | Retry triggered (status code or transient exception) |
 | `Warning` | Request timed out |
-| `Trace` | Request and response headers (one line per header) |
+| `Trace` | Request and response headers (one line per header); `Authorization`, `X-Api-Key`, `Cookie`, and `Set-Cookie` values are redacted |
 
 The `Information` logs fire on every attempt, including retries. The elapsed time in the response log reflects the network round-trip for that attempt only, not the total time including backoff delays.
 

@@ -64,4 +64,31 @@ public sealed class ServiceCollectionExtensionsTests
 
         Assert.Throws<InvalidOperationException>(() => factory.GetClient("unknown"));
     }
+
+    [Fact]
+    public void AddLiteHttpClientWithResilience_Registers_Resolvable_Client()
+    {
+        var services = new ServiceCollection();
+        services.AddSingleton<ILogger<LiteHttpClient>>(NullLogger<LiteHttpClient>.Instance);
+        services.AddLiteHttpClientWithResilience(new LiteHttpClientOptions { BaseAddress = new Uri("https://example.com") });
+
+        using var provider = services.BuildServiceProvider();
+        var client = provider.GetRequiredService<LiteHttpClient>();
+
+        Assert.NotNull(client);
+    }
+
+    [Fact]
+    public void AddNamedLiteHttpClientWithResilience_Registers_Resolvable_Named_Client()
+    {
+        var services = new ServiceCollection();
+        services.AddSingleton<ILogger<LiteHttpClient>>(NullLogger<LiteHttpClient>.Instance);
+        services.AddNamedLiteHttpClientWithResilience("resilient", new LiteHttpClientOptions { BaseAddress = new Uri("https://example.com") });
+
+        using var provider = services.BuildServiceProvider();
+        var factory = provider.GetRequiredService<ILiteHttpClientFactory>();
+        var client  = factory.GetClient("resilient");
+
+        Assert.NotNull(client);
+    }
 }

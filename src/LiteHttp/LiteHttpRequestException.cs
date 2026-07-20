@@ -11,7 +11,7 @@ namespace LiteHttp;
 /// </summary>
 public sealed class LiteHttpRequestException : HttpRequestException
 {
-    /// <summary>The response body, if it could be read. Not truncated — see <see cref="HttpRequestException.Message"/> for a truncated preview.</summary>
+    /// <summary>The response body, if it could be read. Not truncated — see <see cref="System.Exception.Message"/> for a truncated preview.</summary>
     public string? ResponseBody { get; }
 
     public LiteHttpRequestException(HttpStatusCode statusCode, string? responseBody, string message)

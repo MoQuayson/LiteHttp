@@ -37,7 +37,7 @@ public static class ServiceCollectionExtensions
 
         services.TryAddSingleton(sp => new LiteHttpClient(
             options,
-            sp.GetRequiredService<ILogger<LiteHttpClient>>()));
+            sp.GetService<ILogger<LiteHttpClient>>()));
 
         return services;
     }
@@ -58,7 +58,7 @@ public static class ServiceCollectionExtensions
         services.TryAddSingleton<ILiteHttpClientFactory, DefaultLiteHttpClientFactory>();
         services.AddSingleton(sp => new NamedClient(name, new LiteHttpClient(
             options,
-            sp.GetRequiredService<ILogger<LiteHttpClient>>())));
+            sp.GetService<ILogger<LiteHttpClient>>())));
 
         return services;
     }
@@ -68,6 +68,13 @@ public static class ServiceCollectionExtensions
     /// <see cref="ResiliencePipeline{T}"/>. Retrieve via <see cref="ILiteHttpClientFactory"/>.
     /// The client's own retry is disabled (<c>DefaultMaxRetries = 0</c>) to avoid double-retry.
     /// </summary>
+    /// <remarks>
+    /// The client's per-attempt <c>DefaultTimeout</c> (or a per-request <c>RequestOptions.Timeout</c>)
+    /// bounds the *entire* resilience pipeline execution, including every retry the pipeline performs
+    /// internally — it is not a fresh budget per Polly attempt. Size the timeout to comfortably cover
+    /// your worst-case pipeline run (e.g. max retries × max per-try delay × expected upstream latency),
+    /// or a multi-retry Polly policy can be cut off mid-pipeline by the outer timeout.
+    /// </remarks>
     public static IServiceCollection AddNamedLiteHttpClientWithResilience(
         this IServiceCollection services,
         string name,
@@ -83,7 +90,7 @@ public static class ServiceCollectionExtensions
         services.TryAddSingleton<ILiteHttpClientFactory, DefaultLiteHttpClientFactory>();
         services.AddSingleton(sp => new NamedClient(name, new LiteHttpClient(
             options with { DefaultMaxRetries = 0 },
-            sp.GetRequiredService<ILogger<LiteHttpClient>>(),
+            sp.GetService<ILogger<LiteHttpClient>>(),
             pipeline)));
 
         return services;
@@ -94,6 +101,13 @@ public static class ServiceCollectionExtensions
     /// <see cref="ResiliencePipeline{T}"/> for retry, circuit-breaker, and timeout.
     /// The client's own retry is disabled (<c>DefaultMaxRetries = 0</c>) to avoid double-retry.
     /// </summary>
+    /// <remarks>
+    /// The client's per-attempt <c>DefaultTimeout</c> (or a per-request <c>RequestOptions.Timeout</c>)
+    /// bounds the *entire* resilience pipeline execution, including every retry the pipeline performs
+    /// internally — it is not a fresh budget per Polly attempt. Size the timeout to comfortably cover
+    /// your worst-case pipeline run (e.g. max retries × max per-try delay × expected upstream latency),
+    /// or a multi-retry Polly policy can be cut off mid-pipeline by the outer timeout.
+    /// </remarks>
     public static IServiceCollection AddLiteHttpClientWithResilience(
         this IServiceCollection services,
         LiteHttpClientOptions options,
@@ -106,7 +120,7 @@ public static class ServiceCollectionExtensions
 
         services.TryAddSingleton(sp => new LiteHttpClient(
             options with { DefaultMaxRetries = 0 },
-            sp.GetRequiredService<ILogger<LiteHttpClient>>(),
+            sp.GetService<ILogger<LiteHttpClient>>(),
             pipeline));
 
         return services;
@@ -171,7 +185,12 @@ internal sealed class DefaultLiteHttpClientFactory : ILiteHttpClientFactory, IDi
     public DefaultLiteHttpClientFactory(IEnumerable<NamedClient> clients)
     {
         foreach (var nc in clients)
-            _map[nc.Name] = nc.Client;
+        {
+            if (!_map.TryAdd(nc.Name, nc.Client))
+                throw new InvalidOperationException(
+                    $"A LiteHttpClient named '{nc.Name}' is already registered. " +
+                    "Named clients must be registered with unique names.");
+        }
     }
 
     public LiteHttpClient GetClient(string name)

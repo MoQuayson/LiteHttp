@@ -10,6 +10,9 @@ using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using LiteHttp;
+using Polly;
+using Polly.CircuitBreaker;
+using Polly.Retry;
 using Xunit;
 
 namespace LiteHttp.Tests;
@@ -99,6 +102,34 @@ public sealed class LiteHttpClientTests
         Assert.NotNull(result);
         Assert.Equal(99,        result!["Id"]!.GetValue<int>());
         Assert.Equal("created", result!["Name"]!.GetValue<string>());
+    }
+
+    // ── PUT / PATCH (body-less) ─────────────────────────────────────────────
+
+    [Fact]
+    public async Task PutAsync_Sends_PUT_Verb()
+    {
+        using var client = new LiteHttpClient(new StubHandler((req, _) =>
+        {
+            Assert.Equal(HttpMethod.Put, req.Method);
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NoContent));
+        }), new LiteHttpClientOptions { BaseAddress = new Uri("https://test.example.com"), DefaultMaxRetries = 0 });
+
+        using var response = await client.PutAsync("/items/1");
+        Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task PatchAsync_Sends_PATCH_Verb()
+    {
+        using var client = new LiteHttpClient(new StubHandler((req, _) =>
+        {
+            Assert.Equal(HttpMethod.Patch, req.Method);
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NoContent));
+        }), new LiteHttpClientOptions { BaseAddress = new Uri("https://test.example.com"), DefaultMaxRetries = 0 });
+
+        using var response = await client.PatchAsync("/items/1");
+        Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
     }
 
     // ── DELETE ───────────────────────────────────────────────────────────────
@@ -237,6 +268,23 @@ public sealed class LiteHttpClientTests
 
         Assert.Equal(2, callCount);
         Assert.All(bodies, b => Assert.Contains("42", b));
+    }
+
+    [Fact]
+    public async Task Retries_On_Transient_Exception_Then_Succeeds()
+    {
+        int callCount = 0;
+        using var client = new LiteHttpClient(new StubHandler((_, _) =>
+        {
+            callCount++;
+            if (callCount < 3)
+                throw new IOException("connection reset");
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK));
+        }), new LiteHttpClientOptions { BaseAddress = new Uri("https://test.example.com"), DefaultMaxRetries = 3 });
+
+        using var response = await client.GetAsync("/flaky-connection");
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Equal(3, callCount);
     }
 
     // ── Timeout disambiguation ────────────────────────────────────────────────
@@ -572,5 +620,70 @@ public sealed class LiteHttpClientTests
         });
 
         await Assert.ThrowsAsync<TaskCanceledException>(() => client.GetAsync("/cancel-me", ct: cts.Token));
+    }
+
+    // ── Resilience (Polly pipeline) ──────────────────────────────────────────
+
+    [Fact]
+    public async Task ResiliencePipeline_Retries_Transient_Failures_When_Client_Retry_Disabled()
+    {
+        int callCount = 0;
+        var pipeline = new ResiliencePipelineBuilder<HttpResponseMessage>()
+            .AddRetry(new RetryStrategyOptions<HttpResponseMessage>
+            {
+                MaxRetryAttempts = 3,
+                Delay        = TimeSpan.Zero,
+                ShouldHandle = args => ValueTask.FromResult(
+                    args.Outcome.Result?.StatusCode == HttpStatusCode.ServiceUnavailable),
+            })
+            .Build();
+
+        using var client = new LiteHttpClient(new StubHandler((_, _) =>
+        {
+            callCount++;
+            var status = callCount < 3 ? HttpStatusCode.ServiceUnavailable : HttpStatusCode.OK;
+            return Task.FromResult(new HttpResponseMessage(status));
+        }), new LiteHttpClientOptions { BaseAddress = new Uri("https://test.example.com"), DefaultMaxRetries = 0 },
+            resiliencePipeline: pipeline);
+
+        using var response = await client.GetAsync("/flaky");
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Equal(3, callCount);
+    }
+
+    [Fact]
+    public async Task ResiliencePipeline_CircuitBreaker_Opens_After_Threshold_Failures()
+    {
+        int callCount = 0;
+        var pipeline = new ResiliencePipelineBuilder<HttpResponseMessage>()
+            .AddCircuitBreaker(new CircuitBreakerStrategyOptions<HttpResponseMessage>
+            {
+                FailureRatio      = 0.5,
+                MinimumThroughput = 2,
+                SamplingDuration  = TimeSpan.FromSeconds(10),
+                BreakDuration     = TimeSpan.FromSeconds(30),
+                ShouldHandle      = args => ValueTask.FromResult(
+                    args.Outcome.Result?.StatusCode == HttpStatusCode.ServiceUnavailable),
+            })
+            .Build();
+
+        using var client = new LiteHttpClient(new StubHandler((_, _) =>
+        {
+            callCount++;
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.ServiceUnavailable));
+        }), new LiteHttpClientOptions { BaseAddress = new Uri("https://test.example.com"), DefaultMaxRetries = 0 },
+            resiliencePipeline: pipeline);
+
+        // First two calls reach the handler and fail, tripping the breaker
+        // (2 failures / MinimumThroughput 2 => failure ratio 1.0 >= 0.5).
+        using var r1 = await client.GetAsync("/breaker");
+        using var r2 = await client.GetAsync("/breaker");
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, r1.StatusCode);
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, r2.StatusCode);
+
+        // The breaker is now open — the underlying handler must not be invoked again.
+        await Assert.ThrowsAsync<BrokenCircuitException>(() => client.GetAsync("/breaker"));
+        Assert.Equal(2, callCount);
     }
 }
