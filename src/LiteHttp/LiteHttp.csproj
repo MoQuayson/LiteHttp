@@ -6,7 +6,7 @@
     <Authors>MoQuayson</Authors>
     <Copyright>@2026, MoQuayson</Copyright>
     <Company>MoQuayson</Company>
-    <Version>1.0.0</Version>
+    <Version>1.1.0-preview.261101.2</Version>
     <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
     <Description>A production-grade, allocation-minimal HTTP client wrapper for .NET 8+, built on SocketsHttpHandler.</Description>
     <PackageTags>http;httpclient;resilience;polly;dotnet</PackageTags>

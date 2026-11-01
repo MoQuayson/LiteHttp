@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Generic;
+using System.Net.Security;
+using System.Security.Cryptography.X509Certificates;
 using System.Text.Json;
 
 namespace LiteHttp;
@@ -34,12 +36,13 @@ public sealed record LiteHttpClientOptions
     /// than exhausting the whole request's time budget.
     /// </summary>
     /// <remarks>
-    /// The default retried conditions (status codes 408, 429, 500, 502, 503, 504 and
-    /// <see cref="System.Net.Http.HttpRequestException"/>/<see cref="TimeoutException"/>/<see cref="System.IO.IOException"/>)
-    /// all represent failures where the request either never reached the origin's application logic
-    /// or explicitly asked to be retried, so retrying is safe by default even for non-idempotent
-    /// methods (POST/PATCH). If you plug in a custom resilience pipeline with broader retry
-    /// conditions, verify they preserve that property before retrying non-idempotent requests.
+    /// Idempotent methods (GET, HEAD, OPTIONS, PUT, DELETE, TRACE) are retried on status codes 408, 429,
+    /// 500, 502, 503, 504 and on <see cref="System.Net.Http.HttpRequestException"/>/<see cref="TimeoutException"/>/<see cref="System.IO.IOException"/>.
+    /// Non-idempotent methods (POST, PATCH) are retried only when the server did not process the
+    /// request: 408, 429, 503, and connection-level failures that occur before the request is sent
+    /// (connect, DNS, TLS handshake, proxy tunnel). After 500/502/504, timeouts or mid-flight I/O errors
+    /// the server may already have applied the change, so those are not retried unless
+    /// <see cref="RequestOptions.RetryNonIdempotent"/> is set for that request.
     /// </remarks>
     public int DefaultMaxRetries { get; init; } = 3;
 
@@ -53,6 +56,34 @@ public sealed record LiteHttpClientOptions
 
     /// <summary>Whether the handler should manage a cookie container.</summary>
     public bool UseCookies { get; init; } = false;
+
+    /// <summary>
+    /// Private CA root certificates to trust for server certificate validation (custom root trust — the OS
+    /// trust store is <b>not</b> consulted). The certificate chain and
+    /// host name are still fully validated. Opt-in; <c>null</c> (default) uses the OS trust store.
+    /// Ignored when <see cref="ServerCertificateValidationCallback"/> is set.
+    /// </summary>
+    public X509Certificate2Collection? TrustedCaCertificates { get; init; }
+
+    /// <summary>
+    /// SHA-256 thumbprints (hex, case-insensitive, optional <c>:</c> separators) of server leaf
+    /// certificates to accept — for self-signed certificates. A matching pin tolerates an untrusted
+    /// chain but <b>not</b> a host name mismatch. Opt-in; <c>null</c> (default) disables pinning.
+    /// When combined with <see cref="TrustedCaCertificates"/>, satisfying either one is sufficient.
+    /// Ignored when <see cref="ServerCertificateValidationCallback"/> is set.
+    /// </summary>
+    public IReadOnlyCollection<string>? PinnedCertificateSha256 { get; init; }
+
+    /// <summary>
+    /// Fully custom server certificate validation. When set it <b>replaces</b> all built-in checks,
+    /// including <see cref="TrustedCaCertificates"/> and <see cref="PinnedCertificateSha256"/>.
+    /// <para>
+    /// <b>Security warning:</b> a callback that unconditionally returns <c>true</c> disables TLS
+    /// authentication and exposes every request (including credentials) to man-in-the-middle attacks.
+    /// Prefer <see cref="TrustedCaCertificates"/> or <see cref="PinnedCertificateSha256"/>.
+    /// </para>
+    /// </summary>
+    public RemoteCertificateValidationCallback? ServerCertificateValidationCallback { get; init; }
 
     /// <summary>Headers merged into every request sent by this client.</summary>
     public IReadOnlyDictionary<string, string>? DefaultHeaders { get; init; }
@@ -94,6 +125,13 @@ public sealed class RequestOptions
 
     /// <summary>Override the client-level retry count for this request (0 = no retry).</summary>
     public int? MaxRetries { get; set; }
+
+    /// <summary>
+    /// Allows POST/PATCH (and other non-idempotent methods) to be retried after failures where the
+    /// server may already have applied the request: 500, 502, 504, timeouts and mid-flight I/O errors.
+    /// Off by default. Enable only when the call is safe to repeat (e.g. it carries an idempotency key).
+    /// </summary>
+    public bool RetryNonIdempotent { get; set; }
 
     /// <summary>Fluent helper — adds a header to this request.</summary>
     public RequestOptions WithHeader(string name, string value)

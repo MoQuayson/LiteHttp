@@ -36,6 +36,10 @@ dotnet build LiteHttp.sln
 | `src/LiteHttp/ILiteHttpClient.cs` | Public interface for the client. Enables mocking in tests. |
 | `src/LiteHttp/Extensions/ServiceCollectionExtensions.cs` | DI registration: `AddLiteHttpClient(options)` for a singleton, `AddNamedLiteHttpClient(name, options)` for multi-client, `AddLiteHttpClientWithResilience(options)` for Polly integration. Exposes `ILiteHttpClientFactory` / `DefaultLiteHttpClientFactory`. |
 
+### TLS validation
+
+`LiteHttpClientOptions.TrustedCaCertificates` / `PinnedCertificateSha256` / `ServerCertificateValidationCallback` are opt-in and compiled into a single `RemoteCertificateValidationCallback` by `CertificateValidation.Create` (`src/LiteHttp/CertificateValidation.cs`), assigned in `CreateHandler`. Unset → `SslOptions` untouched (OS defaults). Pins and custom roots never bypass host-name mismatch; a custom callback replaces everything. Tests (`CertificateValidationTests.cs`) use a loopback `SslStream` server so they hit the real `SocketsHttpHandler` path.
+
 ### Request flow
 
 Every public method ultimately calls `SendAsync(method, url, body, configure, ct)`, which:
@@ -43,7 +47,7 @@ Every public method ultimately calls `SendAsync(method, url, body, configure, ct
 2. Calls `ExecuteWithRetryAsync`, which loops until success or retries exhausted.
 3. On each loop iteration, creates a fresh `CancellationTokenSource` linking the caller's `ct` to a new per-attempt timeout — **each attempt gets its own full timeout window**, not a shared budget across retries. A per-attempt timeout is treated as a transient failure and consumes one retry rather than aborting the whole operation.
 
-Retried status codes: 408, 429, 500, 502, 503, 504. Retried exceptions: `HttpRequestException`, `TimeoutException`, `IOException`. Back-off is exponential with full jitter (base 200 ms, cap 10 s) unless the response carries a `Retry-After` header, in which case that delay is honored instead (capped at `LiteHttpClientOptions.MaxRetryAfterDelay`, default 60 s). All default-retried conditions are safe to retry even for non-idempotent methods (POST/PATCH) since they imply the request never reached application logic — a custom resilience pipeline with broader conditions must preserve that property itself.
+Retry rules are method-aware. Idempotent methods (GET/HEAD/OPTIONS/PUT/DELETE/TRACE) retry on status codes 408, 429, 500, 502, 503, 504 and on `HttpRequestException`, `TimeoutException`, `IOException`. Non-idempotent methods (POST/PATCH) retry only on 408, 429, 503 and pre-send `HttpRequestException`s (`HttpRequestError` ConnectionError / NameResolutionError / SecureConnectionError / ProxyTunnelError); 500/502/504, per-attempt timeouts and mid-flight `IOException` are not retried because the server may have applied the change, unless `RequestOptions.RetryNonIdempotent` is set. Back-off is exponential with full jitter (base 200 ms, cap 10 s) unless the response carries a `Retry-After` header, in which case that delay is honored instead (capped at `LiteHttpClientOptions.MaxRetryAfterDelay`, default 60 s). A custom resilience pipeline with broader conditions must preserve the non-idempotent safety property itself.
 
 `HttpRequestMessage` must be rebuilt on each retry attempt — `HttpRequestMessage` cannot be resent after the first send.
 

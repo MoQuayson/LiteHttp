@@ -4,6 +4,19 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [1.1.0-preview.261101.2] - 2026-11-01
+
+Prerelease: published as a preview before 1.1.0 so consumers can validate the retry and TLS changes. This supersedes `1.1.0-preview.261101.1`, which was packed from a stale Release build and does not contain the changes below.
+
+### Changed
+
+- **Behavior change:** the built-in retry loop is now method-aware. POST/PATCH (non-idempotent) are retried only on 408, 429, 503 and pre-send connection failures (connect, DNS, TLS handshake, proxy tunnel). They are no longer retried after 500, 502, 504, per-attempt timeouts or mid-flight `IOException`, where the server may already have applied the change. Idempotent methods (GET, HEAD, OPTIONS, PUT, DELETE, TRACE) retry as before. Previously the docs incorrectly described all default-retried conditions as safe for POST/PATCH.
+
+### Added
+
+- `RequestOptions.RetryNonIdempotent` to opt a single POST/PATCH request back in to retrying ambiguous failures (e.g. when it carries an idempotency key).
+- Opt-in TLS server certificate validation on `LiteHttpClientOptions`: `TrustedCaCertificates` (private CA roots), `PinnedCertificateSha256` (self-signed leaf pinning; host name still enforced) and `ServerCertificateValidationCallback` (full custom control). Wired into `SocketsHttpHandler.SslOptions`; none is enabled by default and there is no blanket "ignore errors" flag.
+
 ## [1.0.0] - 2026-07-20
 
 ### Added

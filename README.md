@@ -6,7 +6,8 @@ A production-grade, allocation-minimal HTTP client wrapper for .NET 8+, built on
 
 - Minimal allocations — wraps a single `HttpClient` + `SocketsHttpHandler` as a thread-safe singleton
 - Typed JSON send/receive via `System.Text.Json`
-- Automatic retry with exponential backoff and full jitter
+- Automatic retry with exponential backoff and full jitter — method-aware, so POST/PATCH are never retried after ambiguous failures (500/504/timeouts) unless you opt in
+- Opt-in TLS certificate validation for private CAs and self-signed servers (custom CA roots, thumbprint pinning, or a custom callback)
 - Per-request timeout, headers, bearer token, and API key overrides (fluent API)
 - Streaming support via `IAsyncEnumerable<string>` with zero body buffering
 - Form-urlencoded, multipart/form-data, and raw multipart (mixed, related, …) helpers
@@ -63,6 +64,39 @@ Pass `LiteHttpClientOptions` at construction time. All properties are `init`-onl
 | `DefaultHeaders` | `IReadOnlyDictionary<string, string>?` | `null` | Headers sent on every request |
 | `JsonSerializerOptions` | `JsonSerializerOptions?` | `null` | Custom JSON serializer options |
 
+## TLS / certificate validation
+
+By default LiteHttp uses the OS trust store and rejects untrusted certificates. For self-hosted servers with a private CA or a self-signed certificate, opt in with one of the options below. None of them is enabled by default.
+
+```csharp
+// 1. Trust your private CA (OS trust store is not consulted; chain and host name are still validated)
+var options = new LiteHttpClientOptions
+{
+    BaseAddress = new Uri("https://mail.internal.example"),
+    TrustedCaCertificates = new X509Certificate2Collection(new X509Certificate2("internal-ca.crt")),
+};
+
+// 2. Pin a self-signed server certificate by SHA-256 thumbprint (host name must still match)
+var options = new LiteHttpClientOptions
+{
+    PinnedCertificateSha256 = new[] { "AB:CD:...:EF" },
+};
+
+// 3. Full control (replaces all built-in checks, including options 1 and 2)
+var options = new LiteHttpClientOptions
+{
+    ServerCertificateValidationCallback = (sender, cert, chain, errors) => /* your logic */ false,
+};
+```
+
+| Property | Type | Description |
+|---|---|---|
+| `TrustedCaCertificates` | `X509Certificate2Collection?` | Custom root trust. Chain and host name validated against these roots |
+| `PinnedCertificateSha256` | `IReadOnlyCollection<string>?` | Accepted leaf-certificate SHA-256 thumbprints (hex, `:` allowed). Tolerates an untrusted chain, never a host name mismatch. Malformed values throw `ArgumentException` at construction |
+| `ServerCertificateValidationCallback` | `RemoteCertificateValidationCallback?` | Custom validation; takes precedence over the two options above |
+
+> **Warning:** there is deliberately no "ignore all certificate errors" flag. A callback that always returns `true` disables TLS authentication and exposes credentials to man-in-the-middle attacks. Prefer a CA or a pin.
+
 ## Per-request options
 
 Every method accepts an optional `Action<RequestOptions> configure` delegate for per-request overrides.
@@ -71,6 +105,7 @@ Every method accepts an optional `Action<RequestOptions> configure` delegate for
 |---|---|---|
 | `Timeout` | `TimeSpan?` | Overrides `DefaultTimeout` for this request |
 | `MaxRetries` | `int?` | Overrides `DefaultMaxRetries` for this request |
+| `RetryNonIdempotent` | `bool` | `false`. Allow POST/PATCH to retry after 500/502/504, timeouts and mid-flight I/O errors. See [Retry behavior](#retry-behavior) |
 | `Headers` | `Dictionary<string, string>?` | Additional headers merged for this request |
 | `BearerToken` | `string?` | Sets `Authorization: Bearer <token>` |
 | `ApiKey` | `string?` | Sets `X-Api-Key: <key>` |
@@ -287,13 +322,23 @@ Default circuit breaker parameters:
 
 ## Retry behavior
 
-The built-in retry loop (used when `DefaultMaxRetries > 0` and no Polly pipeline is active) triggers on:
+The built-in retry loop (used when `DefaultMaxRetries > 0` and no Polly pipeline is active) depends on the HTTP method.
 
-**Status codes:** 408, 429, 500, 502, 503, 504
+**Idempotent methods (GET, HEAD, OPTIONS, PUT, DELETE, TRACE)** retry on:
+- Status codes: 408, 429, 500, 502, 503, 504
+- Exceptions: `HttpRequestException`, `TimeoutException`, `IOException`
 
-**Exceptions:** `HttpRequestException`, `TimeoutException`, `IOException`
+**Non-idempotent methods (POST, PATCH)** retry only when the server is known not to have processed the request:
+- Status codes: 408, 429, 503
+- `HttpRequestException` for failures before the request is sent: connection, DNS resolution, TLS handshake and proxy tunnel errors
 
-All of these represent failures where the request either never reached the origin's application logic or explicitly asked to be retried, so retrying is safe by default even for non-idempotent methods (POST/PATCH). A custom resilience pipeline with broader retry conditions must preserve that property itself.
+POST/PATCH are **not** retried after 500, 502, 504, a per-attempt timeout, or a mid-flight `IOException`: the server may already have applied the change, and a retry could duplicate it. If a call is safe to repeat (for example it carries an idempotency key), opt in per request:
+
+```csharp
+await client.PostJsonAsync("/orders", order, o => o.RetryNonIdempotent = true);
+```
+
+A custom resilience pipeline with broader retry conditions must preserve this property itself.
 
 Back-off uses exponential delay with full jitter, unless the response carries a `Retry-After` header — in which case that delay is honored instead (capped at `MaxRetryAfterDelay`, default 60 s):
 

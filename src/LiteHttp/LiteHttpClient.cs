@@ -60,21 +60,31 @@ public sealed class LiteHttpClient : ILiteHttpClient, IDisposable
                 _inner.DefaultRequestHeaders.TryAddWithoutValidation(k, v);
     }
 
-    private static SocketsHttpHandler CreateHandler(LiteHttpClientOptions options) => new()
+    private static SocketsHttpHandler CreateHandler(LiteHttpClientOptions options)
     {
-        PooledConnectionLifetime    = options.PooledConnectionLifetime,
-        PooledConnectionIdleTimeout = options.PooledConnectionIdleTimeout,
-        MaxConnectionsPerServer     = options.MaxConnectionsPerServer,
-        EnableMultipleHttp2Connections = true,
-        KeepAlivePingPolicy  = HttpKeepAlivePingPolicy.WithActiveRequests,
-        KeepAlivePingTimeout = TimeSpan.FromSeconds(15),
-        KeepAlivePingDelay   = TimeSpan.FromSeconds(30),
-        AutomaticDecompression = DecompressionMethods.GZip
-                               | DecompressionMethods.Deflate
-                               | DecompressionMethods.Brotli,
-        UseCookies     = options.UseCookies,
-        ConnectTimeout = options.ConnectTimeout,
-    };
+        var handler = new SocketsHttpHandler
+        {
+            PooledConnectionLifetime    = options.PooledConnectionLifetime,
+            PooledConnectionIdleTimeout = options.PooledConnectionIdleTimeout,
+            MaxConnectionsPerServer     = options.MaxConnectionsPerServer,
+            EnableMultipleHttp2Connections = true,
+            KeepAlivePingPolicy  = HttpKeepAlivePingPolicy.WithActiveRequests,
+            KeepAlivePingTimeout = TimeSpan.FromSeconds(15),
+            KeepAlivePingDelay   = TimeSpan.FromSeconds(30),
+            AutomaticDecompression = DecompressionMethods.GZip
+                                   | DecompressionMethods.Deflate
+                                   | DecompressionMethods.Brotli,
+            UseCookies     = options.UseCookies,
+            ConnectTimeout = options.ConnectTimeout,
+        };
+
+        // Opt-in only: with no TLS options set, SslOptions is untouched and OS defaults apply.
+        var validator = CertificateValidation.Create(options);
+        if (validator is not null)
+            handler.SslOptions.RemoteCertificateValidationCallback = validator;
+
+        return handler;
+    }
 
     // ─────────────────────────────────────────────────────────────────────────
     // Public surface — GET
@@ -438,7 +448,7 @@ public sealed class LiteHttpClient : ILiteHttpClient, IDisposable
                     response = await _inner.SendAsync(request, completion, linkedCts.Token).ConfigureAwait(false);
                 }
 
-                if (ShouldRetry(response.StatusCode) && attempts < maxRetries)
+                if (ShouldRetry(method, response.StatusCode, opts) && attempts < maxRetries)
                 {
                     var retryAfter = GetRetryAfterDelay(response);
                     _logger.LogWarning(
@@ -464,7 +474,7 @@ public sealed class LiteHttpClient : ILiteHttpClient, IDisposable
             {
                 response?.Dispose();
 
-                if (attempts < maxRetries)
+                if (attempts < maxRetries && MayRetryAmbiguousFailure(method, opts))
                 {
                     _logger.LogWarning(
                         "Retry {Attempt}/{Max} for {Method} {Url} — attempt timed out after {Timeout}s",
@@ -479,7 +489,7 @@ public sealed class LiteHttpClient : ILiteHttpClient, IDisposable
                 throw new TimeoutException(
                     $"Request '{method} {url}' timed out after {timeout.TotalSeconds}s ({attempts + 1} attempt(s)).", oce);
             }
-            catch (Exception ex) when (IsTransient(ex) && attempts < maxRetries)
+            catch (Exception ex) when (attempts < maxRetries && IsRetryable(method, ex, opts))
             {
                 response?.Dispose();
                 _logger.LogWarning(ex,
@@ -571,16 +581,46 @@ public sealed class LiteHttpClient : ILiteHttpClient, IDisposable
         return await ReadJsonAsync<TResponse>(response, ct).ConfigureAwait(false);
     }
 
-    private static bool ShouldRetry(HttpStatusCode code) =>
-        code is HttpStatusCode.RequestTimeout          // 408
-             or HttpStatusCode.TooManyRequests         // 429
-             or HttpStatusCode.InternalServerError     // 500
-             or HttpStatusCode.BadGateway              // 502
-             or HttpStatusCode.ServiceUnavailable      // 503
-             or HttpStatusCode.GatewayTimeout;         // 504
+    // Methods whose repeat is defined (RFC 9110 §9.2.2) to leave the server in the same state.
+    private static bool IsIdempotent(HttpMethod m) =>
+        m == HttpMethod.Get || m == HttpMethod.Head || m == HttpMethod.Options ||
+        m == HttpMethod.Put || m == HttpMethod.Delete || m == HttpMethod.Trace;
 
-    private static bool IsTransient(Exception ex) =>
-        ex is HttpRequestException or TimeoutException or IOException;
+    /// <summary>
+    /// Failures after which the server may already have applied the request (timeouts, mid-flight I/O
+    /// errors, 500/502/504) are only retried for idempotent methods, or when the caller opted in via
+    /// <see cref="RequestOptions.RetryNonIdempotent"/>.
+    /// </summary>
+    private static bool MayRetryAmbiguousFailure(HttpMethod method, RequestOptions opts) =>
+        opts.RetryNonIdempotent || IsIdempotent(method);
+
+    private static bool ShouldRetry(HttpMethod method, HttpStatusCode code, RequestOptions opts) =>
+        code switch
+        {
+            // The server explicitly did not process the request — safe for every method.
+            HttpStatusCode.RequestTimeout or HttpStatusCode.TooManyRequests
+                or HttpStatusCode.ServiceUnavailable => true,
+            // The server may have applied the change before failing.
+            HttpStatusCode.InternalServerError or HttpStatusCode.BadGateway
+                or HttpStatusCode.GatewayTimeout => MayRetryAmbiguousFailure(method, opts),
+            _ => false,
+        };
+
+    private static bool IsRetryable(HttpMethod method, Exception ex, RequestOptions opts)
+    {
+        if (!(ex is HttpRequestException or TimeoutException or IOException))
+            return false;
+        if (MayRetryAmbiguousFailure(method, opts))
+            return true;
+        // Non-idempotent: only failures that happened before the request was sent.
+        return ex is HttpRequestException
+        {
+            HttpRequestError: HttpRequestError.ConnectionError
+                or HttpRequestError.NameResolutionError
+                or HttpRequestError.SecureConnectionError
+                or HttpRequestError.ProxyTunnelError
+        };
+    }
 
     /// <summary>
     /// Delay before the next retry attempt. When the server supplied a Retry-After delay, that value
